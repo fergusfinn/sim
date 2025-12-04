@@ -237,6 +237,24 @@ impl Scheduler {
                     .map(|(idx, _)| idx)
                     .unwrap_or(0)
             }
+            SchedulingPolicy::SIF => {
+                // Shortest Input First: find request with smallest input length
+                self.waiting
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.num_prompt_tokens)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            }
+            SchedulingPolicy::LIF => {
+                // Longest Input First: find request with largest input length
+                self.waiting
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.num_prompt_tokens)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(0)
+            }
         }
     }
 
@@ -265,6 +283,22 @@ impl Scheduler {
                     .iter()
                     .enumerate()
                     .max_by_key(|(_, r)| r.max_output_tokens - r.num_output_tokens)
+                    .map(|(idx, _)| idx)
+            }
+            SchedulingPolicy::SIF => {
+                // SIF: preempt the request with longest input
+                self.running
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, r)| r.num_prompt_tokens)
+                    .map(|(idx, _)| idx)
+            }
+            SchedulingPolicy::LIF => {
+                // LIF: preempt the request with shortest input
+                self.running
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, r)| r.num_prompt_tokens)
                     .map(|(idx, _)| idx)
             }
         }

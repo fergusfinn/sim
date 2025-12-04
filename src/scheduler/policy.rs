@@ -7,6 +7,10 @@ pub enum SchedulingPolicy {
     Priority,
     /// Shortest Job First: prioritize requests with smallest output length
     SJF,
+    /// Shortest Input First: prioritize requests with smallest input length
+    SIF,
+    /// Longest Input First: prioritize requests with largest input length
+    LIF,
 }
 
 impl SchedulingPolicy {
@@ -15,6 +19,8 @@ impl SchedulingPolicy {
             "fcfs" => Ok(SchedulingPolicy::FCFS),
             "priority" => Ok(SchedulingPolicy::Priority),
             "sjf" => Ok(SchedulingPolicy::SJF),
+            "sif" => Ok(SchedulingPolicy::SIF),
+            "lif" => Ok(SchedulingPolicy::LIF),
             _ => Err(format!("Unknown scheduling policy: {}", s)),
         }
     }
@@ -45,6 +51,22 @@ mod tests {
         assert_eq!(
             SchedulingPolicy::from_str("SJF").unwrap(),
             SchedulingPolicy::SJF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("sif").unwrap(),
+            SchedulingPolicy::SIF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("SIF").unwrap(),
+            SchedulingPolicy::SIF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("lif").unwrap(),
+            SchedulingPolicy::LIF
+        );
+        assert_eq!(
+            SchedulingPolicy::from_str("LIF").unwrap(),
+            SchedulingPolicy::LIF
         );
         assert!(SchedulingPolicy::from_str("unknown").is_err());
     }
