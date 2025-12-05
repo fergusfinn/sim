@@ -12,6 +12,8 @@ import {
   Legend,
   Filler,
 } from 'chart.js'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import './App.css'
 
 // Register Chart.js components
@@ -51,6 +53,8 @@ interface SimulationConfig {
     num_heads: number
     num_kv_heads?: number
     max_seq_len: number
+    sliding_window?: number
+    num_sliding_layers?: number
   }
   scheduler: {
     max_num_batched_tokens: number
@@ -102,8 +106,17 @@ interface SimulationResults {
     per_token_p90: number
     per_token_p99: number
     input_tokens_per_sec: number
+    input_tokens_per_sec_p50: number
+    input_tokens_per_sec_p90: number
+    input_tokens_per_sec_p99: number
     output_tokens_per_sec: number
+    output_tokens_per_sec_p50: number
+    output_tokens_per_sec_p90: number
+    output_tokens_per_sec_p99: number
     requests_per_sec: number
+    requests_per_sec_p50: number
+    requests_per_sec_p90: number
+    requests_per_sec_p99: number
     avg_kv_cache_util: number
     avg_flops_util: number
     avg_bandwidth_util: number
@@ -127,6 +140,14 @@ interface SimulationResults {
   distributions: {
     input_lengths: number[]
     output_lengths: number[]
+  }
+  latency_samples: {
+    ttft_samples: number[]
+    e2e_samples: number[]
+    tpot_samples: number[]
+    ttft_timestamps: number[]
+    e2e_timestamps: number[]
+    tpot_timestamps: number[]
   }
 }
 
@@ -279,6 +300,18 @@ const MODEL_PRESETS: Record<string, SimulationConfig['model']> = {
     num_kv_heads: 4,
     max_seq_len: 32768,
   },
+  'GPT-OSS-120B': {
+    name: "GPT-OSS-120B (MoE, 4/128 experts)",
+    num_parameters: 120000000000, // Total params with all 128 experts
+    num_active_parameters: 6000000000, // Active params with 4 experts per token
+    num_layers: 36,
+    hidden_dim: 2880,
+    num_heads: 64,
+    num_kv_heads: 8,
+    max_seq_len: 131072,
+    sliding_window: 128, // Sliding window size for 18 layers
+    num_sliding_layers: 18, // Half the layers use sliding window
+  },
 }
 
 // Helper function to compute effective hardware config with TP
@@ -409,6 +442,15 @@ function createHistogram(values: number[], numBins: number = 30): { bins: string
 
   const min = Math.min(...values)
   const max = Math.max(...values)
+
+  // Handle degenerate case where all values are the same (fixed distribution)
+  if (min === max) {
+    return {
+      bins: [`${Math.round(min)}`],
+      counts: [values.length]
+    }
+  }
+
   const binSize = (max - min) / numBins
 
   const counts = new Array(numBins).fill(0)
@@ -464,7 +506,7 @@ num_parameters = ${model.num_parameters}${model.num_active_parameters ? `\nnum_a
 num_layers = ${model.num_layers}
 hidden_dim = ${model.hidden_dim}
 num_heads = ${model.num_heads}${model.num_kv_heads ? `\nnum_kv_heads = ${model.num_kv_heads}` : ''}
-max_seq_len = ${model.max_seq_len}
+max_seq_len = ${model.max_seq_len}${model.sliding_window ? `\nsliding_window = ${model.sliding_window}` : ''}${model.num_sliding_layers ? `\nnum_sliding_layers = ${model.num_sliding_layers}` : ''}
 
 [scheduler]
 max_num_batched_tokens = ${scheduler.max_num_batched_tokens}
@@ -820,6 +862,36 @@ function App() {
                       onChange={(e) => updateConfig(['model', 'hidden_dim'], parseInt(e.target.value))}
                     />
                   </div>
+                  <div className="input-group">
+                    <label>Sliding Window Size</label>
+                    <input
+                      type="number"
+                      value={config.model.sliding_window || ''}
+                      placeholder="None (full attention)"
+                      onChange={(e) => {
+                        const value = e.target.value === '' ? undefined : parseInt(e.target.value)
+                        updateConfig(['model', 'sliding_window'], value)
+                      }}
+                    />
+                    <small style={{ fontSize: '0.85em', color: 'var(--gray-600)', marginTop: '0.25rem' }}>
+                      Context window size for sliding attention layers (leave empty for full attention)
+                    </small>
+                  </div>
+                  <div className="input-group">
+                    <label>Number of Sliding Layers</label>
+                    <input
+                      type="number"
+                      value={config.model.num_sliding_layers || ''}
+                      placeholder="0"
+                      onChange={(e) => {
+                        const value = e.target.value === '' ? undefined : parseInt(e.target.value)
+                        updateConfig(['model', 'num_sliding_layers'], value)
+                      }}
+                    />
+                    <small style={{ fontSize: '0.85em', color: 'var(--gray-600)', marginTop: '0.25rem' }}>
+                      Number of layers using sliding window (rest use full attention)
+                    </small>
+                  </div>
                 </div>
               )}
             </section>
@@ -1118,36 +1190,105 @@ function App() {
               <div className="metrics-section">
                 <h3>Latency</h3>
                 <div className="metrics-grid">
-                  <div className="metric-card">
-                    <div className="metric-label">Time to First Token</div>
-                    <div className="metric-value">
-                      {formatLatency(results.metrics.ttft_mean).display}
-                      <span className="unit">{formatLatency(results.metrics.ttft_mean).unit}</span>
-                    </div>
-                    <div className="metric-detail">
-                      P50: {formatLatency(results.metrics.ttft_p50).display}{formatLatency(results.metrics.ttft_p50).unit} | P90: {formatLatency(results.metrics.ttft_p90).display}{formatLatency(results.metrics.ttft_p90).unit} | P99: {formatLatency(results.metrics.ttft_p99).display}{formatLatency(results.metrics.ttft_p99).unit}
+                  <div className="metric-card latency-card">
+                    <div className="metric-label">Time to First Token (TTFT)</div>
+                    <div className="percentile-grid">
+                      <div className="percentile-item">
+                        <div className="percentile-label">Mean</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.ttft_mean).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.ttft_mean).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p50">
+                        <div className="percentile-label">p50</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.ttft_p50).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.ttft_p50).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p90">
+                        <div className="percentile-label">p90</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.ttft_p90).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.ttft_p90).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p99">
+                        <div className="percentile-label">p99</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.ttft_p99).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.ttft_p99).unit}</span>
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                  <div className="metric-card">
-                    <div className="metric-label">End-to-End Latency</div>
-                    <div className="metric-value">
-                      {formatLatency(results.metrics.e2e_mean).display}
-                      <span className="unit">{formatLatency(results.metrics.e2e_mean).unit}</span>
-                    </div>
-                    <div className="metric-detail">
-                      P50: {formatLatency(results.metrics.e2e_p50).display}{formatLatency(results.metrics.e2e_p50).unit} | P90: {formatLatency(results.metrics.e2e_p90).display}{formatLatency(results.metrics.e2e_p90).unit} | P99: {formatLatency(results.metrics.e2e_p99).display}{formatLatency(results.metrics.e2e_p99).unit}
+                  <div className="metric-card latency-card">
+                    <div className="metric-label">End-to-End Latency (E2E)</div>
+                    <div className="percentile-grid">
+                      <div className="percentile-item">
+                        <div className="percentile-label">Mean</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.e2e_mean).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.e2e_mean).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p50">
+                        <div className="percentile-label">p50</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.e2e_p50).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.e2e_p50).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p90">
+                        <div className="percentile-label">p90</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.e2e_p90).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.e2e_p90).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p99">
+                        <div className="percentile-label">p99</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.e2e_p99).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.e2e_p99).unit}</span>
+                        </div>
+                      </div>
                     </div>
                   </div>
 
-                  <div className="metric-card">
-                    <div className="metric-label">Per-Token Latency</div>
-                    <div className="metric-value">
-                      {formatLatency(results.metrics.per_token_mean).display}
-                      <span className="unit">{formatLatency(results.metrics.per_token_mean).unit}</span>
-                    </div>
-                    <div className="metric-detail">
-                      P50: {formatLatency(results.metrics.per_token_p50).display}{formatLatency(results.metrics.per_token_p50).unit} | P90: {formatLatency(results.metrics.per_token_p90).display}{formatLatency(results.metrics.per_token_p90).unit} | P99: {formatLatency(results.metrics.per_token_p99).display}{formatLatency(results.metrics.per_token_p99).unit}
+                  <div className="metric-card latency-card">
+                    <div className="metric-label">Time per Output Token (TPOT)</div>
+                    <div className="percentile-grid">
+                      <div className="percentile-item">
+                        <div className="percentile-label">Mean</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.per_token_mean).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.per_token_mean).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p50">
+                        <div className="percentile-label">p50</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.per_token_p50).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.per_token_p50).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p90">
+                        <div className="percentile-label">p90</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.per_token_p90).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.per_token_p90).unit}</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p99">
+                        <div className="percentile-label">p99</div>
+                        <div className="percentile-value">
+                          {formatLatency(results.metrics.per_token_p99).display}
+                          <span className="percentile-unit">{formatLatency(results.metrics.per_token_p99).unit}</span>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -1156,19 +1297,106 @@ function App() {
               <div className="metrics-section">
                 <h3>Throughput</h3>
                 <div className="metrics-grid">
-                  <div className="metric-card">
-                    <div className="metric-label">Input Tokens</div>
-                    <div className="metric-value">{results.metrics.input_tokens_per_sec.toFixed(0)}<span className="unit">tok/s</span></div>
+                  <div className="metric-card latency-card">
+                    <div className="metric-label">Input Tokens per Second</div>
+                    <div className="percentile-grid">
+                      <div className="percentile-item">
+                        <div className="percentile-label">Mean</div>
+                        <div className="percentile-value">
+                          {results.metrics.input_tokens_per_sec.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p50">
+                        <div className="percentile-label">p50</div>
+                        <div className="percentile-value">
+                          {results.metrics.input_tokens_per_sec_p50.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p90">
+                        <div className="percentile-label">p90</div>
+                        <div className="percentile-value">
+                          {results.metrics.input_tokens_per_sec_p90.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p99">
+                        <div className="percentile-label">p99</div>
+                        <div className="percentile-value">
+                          {results.metrics.input_tokens_per_sec_p99.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                    </div>
                   </div>
 
-                  <div className="metric-card">
-                    <div className="metric-label">Output Tokens</div>
-                    <div className="metric-value">{results.metrics.output_tokens_per_sec.toFixed(0)}<span className="unit">tok/s</span></div>
+                  <div className="metric-card latency-card">
+                    <div className="metric-label">Output Tokens per Second</div>
+                    <div className="percentile-grid">
+                      <div className="percentile-item">
+                        <div className="percentile-label">Mean</div>
+                        <div className="percentile-value">
+                          {results.metrics.output_tokens_per_sec.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p50">
+                        <div className="percentile-label">p50</div>
+                        <div className="percentile-value">
+                          {results.metrics.output_tokens_per_sec_p50.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p90">
+                        <div className="percentile-label">p90</div>
+                        <div className="percentile-value">
+                          {results.metrics.output_tokens_per_sec_p90.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p99">
+                        <div className="percentile-label">p99</div>
+                        <div className="percentile-value">
+                          {results.metrics.output_tokens_per_sec_p99.toFixed(0)}
+                          <span className="percentile-unit">tok/s</span>
+                        </div>
+                      </div>
+                    </div>
                   </div>
 
-                  <div className="metric-card">
-                    <div className="metric-label">Request Rate</div>
-                    <div className="metric-value">{results.metrics.requests_per_sec.toFixed(2)}<span className="unit">req/s</span></div>
+                  <div className="metric-card latency-card">
+                    <div className="metric-label">Requests per Second</div>
+                    <div className="percentile-grid">
+                      <div className="percentile-item">
+                        <div className="percentile-label">Mean</div>
+                        <div className="percentile-value">
+                          {results.metrics.requests_per_sec.toFixed(2)}
+                          <span className="percentile-unit">req/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p50">
+                        <div className="percentile-label">p50</div>
+                        <div className="percentile-value">
+                          {results.metrics.requests_per_sec_p50.toFixed(2)}
+                          <span className="percentile-unit">req/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p90">
+                        <div className="percentile-label">p90</div>
+                        <div className="percentile-value">
+                          {results.metrics.requests_per_sec_p90.toFixed(2)}
+                          <span className="percentile-unit">req/s</span>
+                        </div>
+                      </div>
+                      <div className="percentile-item p99">
+                        <div className="percentile-label">p99</div>
+                        <div className="percentile-value">
+                          {results.metrics.requests_per_sec_p99.toFixed(2)}
+                          <span className="percentile-unit">req/s</span>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -1176,21 +1404,6 @@ function App() {
               <div className="metrics-section">
                 <h3>Resource Utilization</h3>
                 <div className="utilization-bars">
-                  <div className="util-bar">
-                    <div className="util-label">
-                      <span>GPU</span>
-                      <span className="util-value">{(Math.max(results.metrics.avg_flops_util, results.metrics.avg_bandwidth_util) * 100).toFixed(1)}%</span>
-                    </div>
-                    <div className="util-track">
-                      <div
-                        className="util-fill gpu"
-                        style={{ width: `${Math.max(results.metrics.avg_flops_util, results.metrics.avg_bandwidth_util) * 100}%` }}
-                      />
-                    </div>
-                    <div className="metric-detail" style={{ marginTop: '4px', fontSize: '0.85em', opacity: 0.7 }}>
-                      {results.metrics.avg_flops_util > results.metrics.avg_bandwidth_util ? 'Compute-bound' : 'Memory-bound'}
-                    </div>
-                  </div>
                   <div className="util-bar">
                     <div className="util-label">
                       <span>Compute (FLOPS)</span>
@@ -1637,19 +1850,20 @@ function App() {
                     📋 Copy to Clipboard
                   </button>
                 </div>
-                <pre style={{
-                  background: 'var(--gray-900)',
-                  color: '#f8f8f2',
-                  padding: '1.5rem',
-                  borderRadius: '8px',
-                  overflow: 'auto',
-                  maxHeight: 'calc(100vh - 300px)',
-                  fontSize: '0.9rem',
-                  lineHeight: '1.5',
-                  fontFamily: "'Consolas', 'Monaco', 'Courier New', monospace"
-                }}>
-                  <code>{generateTOML(config)}</code>
-                </pre>
+                <SyntaxHighlighter
+                  language="toml"
+                  style={vscDarkPlus}
+                  customStyle={{
+                    borderRadius: '8px',
+                    maxHeight: 'calc(100vh - 300px)',
+                    fontSize: '0.9rem',
+                    lineHeight: '1.5',
+                    margin: 0,
+                  }}
+                  showLineNumbers
+                >
+                  {generateTOML(config)}
+                </SyntaxHighlighter>
               </div>
             )}
           </div>

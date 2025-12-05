@@ -72,6 +72,8 @@ impl Config {
             num_heads: 32,
             num_kv_heads: None,
             max_seq_len: 2048,
+            sliding_window: None,
+            num_sliding_layers: None,
             kv_cache_bytes_per_token: 0,
         };
         model.compute_kv_cache_size(hardware.bytes_per_param);
@@ -144,6 +146,8 @@ mod tests {
             num_heads: 32,
             num_kv_heads: None,
             max_seq_len: 2048,
+            sliding_window: None,
+            num_sliding_layers: None,
             kv_cache_bytes_per_token: 0,
         };
         model.compute_kv_cache_size(2); // bf16

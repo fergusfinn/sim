@@ -4,13 +4,21 @@ use crate::request::Request;
 pub struct MetricsCollector {
     // Latency metrics (in seconds)
     ttft_samples: Vec<f64>,
+    ttft_timestamps: Vec<f64>,
     e2e_latency_samples: Vec<f64>,
+    e2e_timestamps: Vec<f64>,
     per_token_latency_samples: Vec<f64>,
+    per_token_timestamps: Vec<f64>,
 
     // Throughput metrics
     total_input_tokens: u64,
     total_output_tokens: u64,
     start_time: f64,
+
+    // Throughput samples (sampled periodically)
+    input_tokens_per_sec_samples: Vec<f64>,
+    output_tokens_per_sec_samples: Vec<f64>,
+    requests_per_sec_samples: Vec<f64>,
 
     // Resource utilization (sampled periodically)
     kv_cache_utilization_samples: Vec<f64>,
@@ -34,11 +42,17 @@ impl MetricsCollector {
     pub fn new(start_time: f64) -> Self {
         Self {
             ttft_samples: Vec::new(),
+            ttft_timestamps: Vec::new(),
             e2e_latency_samples: Vec::new(),
+            e2e_timestamps: Vec::new(),
             per_token_latency_samples: Vec::new(),
+            per_token_timestamps: Vec::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             start_time,
+            input_tokens_per_sec_samples: Vec::new(),
+            output_tokens_per_sec_samples: Vec::new(),
+            requests_per_sec_samples: Vec::new(),
             kv_cache_utilization_samples: Vec::new(),
             flops_utilization_samples: Vec::new(),
             bandwidth_utilization_samples: Vec::new(),
@@ -57,12 +71,14 @@ impl MetricsCollector {
         if let Some(ttft_time) = request.first_token_time {
             let ttft = ttft_time - request.arrival_time;
             self.ttft_samples.push(ttft);
+            self.ttft_timestamps.push(ttft_time);
         }
 
         // E2E latency (excluding time spent preempted)
         if let Some(completion_time) = request.completion_time {
             let e2e = completion_time - request.arrival_time - request.preempted_time;
             self.e2e_latency_samples.push(e2e);
+            self.e2e_timestamps.push(completion_time);
         }
 
         // Per-token latency (for decode phase)
@@ -70,6 +86,7 @@ impl MetricsCollector {
             let prev_time = request.token_generation_times[i - 1];
             let curr_time = request.token_generation_times[i];
             self.per_token_latency_samples.push(curr_time - prev_time);
+            self.per_token_timestamps.push(curr_time);
         }
 
         // Throughput counters
@@ -97,6 +114,19 @@ impl MetricsCollector {
         &self.output_lengths
     }
 
+    /// Get latency samples with timestamps
+    pub fn get_latency_samples(&self) -> (
+        (&[f64], &[f64]), // (ttft_samples, ttft_timestamps)
+        (&[f64], &[f64]), // (e2e_samples, e2e_timestamps)
+        (&[f64], &[f64]), // (tpot_samples, tpot_timestamps)
+    ) {
+        (
+            (&self.ttft_samples, &self.ttft_timestamps),
+            (&self.e2e_latency_samples, &self.e2e_timestamps),
+            (&self.per_token_latency_samples, &self.per_token_timestamps),
+        )
+    }
+
     /// Record iteration metrics (utilization)
     pub fn record_iteration_metrics(
         &mut self,
@@ -107,6 +137,19 @@ impl MetricsCollector {
         self.kv_cache_utilization_samples.push(kv_cache_util);
         self.flops_utilization_samples.push(flops_util);
         self.bandwidth_utilization_samples.push(bandwidth_util);
+    }
+
+    /// Record throughput metrics (sampled periodically)
+    pub fn record_throughput_sample(&mut self, current_time: f64) {
+        let elapsed = current_time - self.start_time;
+        if elapsed > 0.0 {
+            self.input_tokens_per_sec_samples
+                .push(self.total_input_tokens as f64 / elapsed);
+            self.output_tokens_per_sec_samples
+                .push(self.total_output_tokens as f64 / elapsed);
+            self.requests_per_sec_samples
+                .push(self.completed_requests as f64 / elapsed);
+        }
     }
 
     /// Compute final summary statistics
@@ -132,8 +175,19 @@ impl MetricsCollector {
 
             // Throughput
             input_tokens_per_sec: self.total_input_tokens as f64 / elapsed,
+            input_tokens_per_sec_p50: percentile(&self.input_tokens_per_sec_samples, 0.5),
+            input_tokens_per_sec_p90: percentile(&self.input_tokens_per_sec_samples, 0.9),
+            input_tokens_per_sec_p99: percentile(&self.input_tokens_per_sec_samples, 0.99),
+
             output_tokens_per_sec: self.total_output_tokens as f64 / elapsed,
+            output_tokens_per_sec_p50: percentile(&self.output_tokens_per_sec_samples, 0.5),
+            output_tokens_per_sec_p90: percentile(&self.output_tokens_per_sec_samples, 0.9),
+            output_tokens_per_sec_p99: percentile(&self.output_tokens_per_sec_samples, 0.99),
+
             requests_per_sec: self.completed_requests as f64 / elapsed,
+            requests_per_sec_p50: percentile(&self.requests_per_sec_samples, 0.5),
+            requests_per_sec_p90: percentile(&self.requests_per_sec_samples, 0.9),
+            requests_per_sec_p99: percentile(&self.requests_per_sec_samples, 0.99),
 
             // Utilization (average over all samples)
             avg_kv_cache_util: mean(&self.kv_cache_utilization_samples),

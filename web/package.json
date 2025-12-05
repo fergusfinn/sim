@@ -11,10 +11,12 @@
     "rebuild-wasm": "cd .. && wasm-pack build --target web --no-default-features && cd web && npm install"
   },
   "dependencies": {
+    "@types/react-syntax-highlighter": "^15.5.13",
     "chart.js": "^4.5.1",
     "react": "^19.2.0",
     "react-chartjs-2": "^5.3.1",
     "react-dom": "^19.2.0",
+    "react-syntax-highlighter": "^16.1.0",
     "sim": "file:../pkg"
   },
   "devDependencies": {

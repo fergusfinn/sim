@@ -420,11 +420,18 @@ body {
   transition: all 0.2s ease;
   border-bottom: 3px solid transparent;
   margin-bottom: -2px;
+  border-radius: 0;
+  outline: none;
 }
 
 .tab:hover {
   color: var(--primary);
   background: var(--gray-50);
+  border-radius: 0;
+}
+
+.tab:focus {
+  outline: none;
 }
 
 .tab.active {
@@ -501,6 +508,82 @@ body {
 .metric-detail {
   font-size: 0.75rem;
   opacity: 0.75;
+}
+
+/* Latency Cards with Percentiles */
+.latency-card {
+  padding: 1.5rem;
+}
+
+.percentile-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.percentile-item {
+  text-align: center;
+  padding: 0.75rem;
+  background: var(--gray-50);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  transition: all 0.2s;
+}
+
+.percentile-item:hover {
+  background: var(--gray-100);
+}
+
+.percentile-item.p50 {
+  border-color: var(--success);
+  background: rgba(16, 185, 129, 0.05);
+}
+
+.percentile-item.p90 {
+  border-color: var(--warning);
+  background: rgba(245, 158, 11, 0.05);
+}
+
+.percentile-item.p99 {
+  border-color: var(--danger);
+  background: rgba(239, 68, 68, 0.05);
+}
+
+.percentile-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--gray-600);
+  margin-bottom: 0.5rem;
+}
+
+.percentile-item.p50 .percentile-label {
+  color: var(--success);
+}
+
+.percentile-item.p90 .percentile-label {
+  color: var(--warning);
+}
+
+.percentile-item.p99 .percentile-label {
+  color: var(--danger);
+}
+
+.percentile-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  line-height: 1.2;
+  color: var(--gray-900);
+}
+
+.percentile-unit {
+  font-size: 0.875rem;
+  font-weight: 500;
+  margin-left: 0.25rem;
+  opacity: 0.7;
 }
 
 /* Utilization Section */
@@ -680,5 +763,14 @@ body {
   .completion-badge {
     font-size: 0.8rem;
     padding: 0.5rem 1rem;
+  }
+
+  .percentile-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.75rem;
+  }
+
+  .percentile-value {
+    font-size: 1.25rem;
   }
 }

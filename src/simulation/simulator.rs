@@ -205,6 +205,9 @@ impl Simulator {
                     }
                 }
 
+                // Record throughput sample
+                self.metrics.record_throughput_sample(self.current_time);
+
                 self.time_series_data.push(TimeSeriesPoint {
                     time: self.current_time,
                     arrivals: self.metrics.total_requests,
@@ -294,6 +297,14 @@ impl Simulator {
 
     pub fn get_current_time(&self) -> f64 {
         self.current_time
+    }
+
+    pub fn get_latency_samples(&self) -> (
+        (&[f64], &[f64]), // (ttft_samples, ttft_timestamps)
+        (&[f64], &[f64]), // (e2e_samples, e2e_timestamps)
+        (&[f64], &[f64]), // (tpot_samples, tpot_timestamps)
+    ) {
+        self.metrics.get_latency_samples()
     }
 
     fn log_progress(&self) {

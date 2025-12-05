@@ -31,6 +31,8 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
     let input_lengths = simulator.get_input_lengths();
     let output_lengths = simulator.get_output_lengths();
     let total_time = simulator.get_current_time();
+    let ((ttft_samples, ttft_timestamps), (e2e_samples, e2e_timestamps), (tpot_samples, tpot_timestamps)) =
+        simulator.get_latency_samples();
 
     let result = SimulationResult {
         metrics: MetricsData {
@@ -47,8 +49,17 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
             per_token_p90: summary.per_token_p90,
             per_token_p99: summary.per_token_p99,
             input_tokens_per_sec: summary.input_tokens_per_sec,
+            input_tokens_per_sec_p50: summary.input_tokens_per_sec_p50,
+            input_tokens_per_sec_p90: summary.input_tokens_per_sec_p90,
+            input_tokens_per_sec_p99: summary.input_tokens_per_sec_p99,
             output_tokens_per_sec: summary.output_tokens_per_sec,
+            output_tokens_per_sec_p50: summary.output_tokens_per_sec_p50,
+            output_tokens_per_sec_p90: summary.output_tokens_per_sec_p90,
+            output_tokens_per_sec_p99: summary.output_tokens_per_sec_p99,
             requests_per_sec: summary.requests_per_sec,
+            requests_per_sec_p50: summary.requests_per_sec_p50,
+            requests_per_sec_p90: summary.requests_per_sec_p90,
+            requests_per_sec_p99: summary.requests_per_sec_p99,
             avg_kv_cache_util: summary.avg_kv_cache_util,
             avg_flops_util: summary.avg_flops_util,
             avg_bandwidth_util: summary.avg_bandwidth_util,
@@ -73,6 +84,14 @@ pub fn run_simulation(config_json: &str) -> Result<JsValue, JsValue> {
             input_lengths: input_lengths.to_vec(),
             output_lengths: output_lengths.to_vec(),
         },
+        latency_samples: LatencySamplesData {
+            ttft_samples: ttft_samples.iter().map(|&x| x * 1000.0).collect(),  // Convert to ms
+            e2e_samples: e2e_samples.iter().map(|&x| x * 1000.0).collect(),    // Convert to ms
+            tpot_samples: tpot_samples.iter().map(|&x| x * 1000.0).collect(),  // Convert to ms
+            ttft_timestamps: ttft_timestamps.to_vec(),
+            e2e_timestamps: e2e_timestamps.to_vec(),
+            tpot_timestamps: tpot_timestamps.to_vec(),
+        },
     };
 
     Ok(serde_wasm_bindgen::to_value(&result)?)
@@ -83,6 +102,7 @@ struct SimulationResult {
     metrics: MetricsData,
     time_series: TimeSeriesData,
     distributions: DistributionData,
+    latency_samples: LatencySamplesData,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,8 +120,17 @@ struct MetricsData {
     per_token_p90: f64,
     per_token_p99: f64,
     input_tokens_per_sec: f64,
+    input_tokens_per_sec_p50: f64,
+    input_tokens_per_sec_p90: f64,
+    input_tokens_per_sec_p99: f64,
     output_tokens_per_sec: f64,
+    output_tokens_per_sec_p50: f64,
+    output_tokens_per_sec_p90: f64,
+    output_tokens_per_sec_p99: f64,
     requests_per_sec: f64,
+    requests_per_sec_p50: f64,
+    requests_per_sec_p90: f64,
+    requests_per_sec_p99: f64,
     avg_kv_cache_util: f64,
     avg_flops_util: f64,
     avg_bandwidth_util: f64,
@@ -129,4 +158,14 @@ struct TimeSeriesData {
 struct DistributionData {
     input_lengths: Vec<u32>,
     output_lengths: Vec<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LatencySamplesData {
+    ttft_samples: Vec<f64>,      // in ms
+    e2e_samples: Vec<f64>,       // in ms
+    tpot_samples: Vec<f64>,      // in ms
+    ttft_timestamps: Vec<f64>,   // completion time for each sample
+    e2e_timestamps: Vec<f64>,    // completion time for each sample
+    tpot_timestamps: Vec<f64>,   // generation time for each token
 }
