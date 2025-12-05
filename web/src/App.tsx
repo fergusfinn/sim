@@ -370,12 +370,14 @@ const DEFAULT_CONFIG: SimulationConfig = {
     num_concurrent_users: 64,
     seed: 42,
     input_len_dist: {
-      type: "fixed",
-      value: 1024,
+      type: "lognormal",
+      mean: 6.9,
+      std_dev: 0.7,
     },
     output_len_dist: {
-      type: "fixed",
-      value: 1024,
+      type: "lognormal",
+      mean: 5.3,
+      std_dev: 0.8,
     },
   },
   simulation: {
