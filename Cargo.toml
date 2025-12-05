@@ -16,15 +16,17 @@ rand_distr = "0.4"
 ordered-float = "4.0"
 env_logger = { version = "0.11", optional = true }
 log = "0.4"
-plotters = { version = "0.3", optional = true }
+tabled = { version = "0.16", optional = true }
+colored = { version = "2.1", optional = true }
 wasm-bindgen = "0.2"
 serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 console_error_panic_hook = "0.1"
 
 [features]
 default = ["cli"]
-cli = ["clap", "env_logger", "plotters"]
+cli = ["clap", "env_logger", "tabled", "colored"]
 
 [profile.release]
 opt-level = "s"  # Optimize for size in WASM

@@ -1,14 +1,20 @@
 use super::summary::MetricsSummary;
+use super::quantile::StreamingQuantiles;
 use crate::request::Request;
 
 pub struct MetricsCollector {
-    // Latency metrics (in seconds)
+    // Latency metrics (in seconds) - keep recent samples with timestamps for windowing
     ttft_samples: Vec<f64>,
     ttft_timestamps: Vec<f64>,
     e2e_latency_samples: Vec<f64>,
     e2e_timestamps: Vec<f64>,
     per_token_latency_samples: Vec<f64>,
     per_token_timestamps: Vec<f64>,
+
+    // Streaming quantiles for efficient percentile computation
+    ttft_quantiles: StreamingQuantiles,
+    e2e_quantiles: StreamingQuantiles,
+    per_token_quantiles: StreamingQuantiles,
 
     // Throughput metrics
     total_input_tokens: u64,
@@ -19,6 +25,11 @@ pub struct MetricsCollector {
     input_tokens_per_sec_samples: Vec<f64>,
     output_tokens_per_sec_samples: Vec<f64>,
     requests_per_sec_samples: Vec<f64>,
+
+    // Streaming quantiles for throughput
+    input_tokens_per_sec_quantiles: StreamingQuantiles,
+    output_tokens_per_sec_quantiles: StreamingQuantiles,
+    requests_per_sec_quantiles: StreamingQuantiles,
 
     // Resource utilization (sampled periodically)
     kv_cache_utilization_samples: Vec<f64>,
@@ -47,12 +58,18 @@ impl MetricsCollector {
             e2e_timestamps: Vec::new(),
             per_token_latency_samples: Vec::new(),
             per_token_timestamps: Vec::new(),
+            ttft_quantiles: StreamingQuantiles::new(),
+            e2e_quantiles: StreamingQuantiles::new(),
+            per_token_quantiles: StreamingQuantiles::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             start_time,
             input_tokens_per_sec_samples: Vec::new(),
             output_tokens_per_sec_samples: Vec::new(),
             requests_per_sec_samples: Vec::new(),
+            input_tokens_per_sec_quantiles: StreamingQuantiles::new(),
+            output_tokens_per_sec_quantiles: StreamingQuantiles::new(),
+            requests_per_sec_quantiles: StreamingQuantiles::new(),
             kv_cache_utilization_samples: Vec::new(),
             flops_utilization_samples: Vec::new(),
             bandwidth_utilization_samples: Vec::new(),
@@ -67,11 +84,14 @@ impl MetricsCollector {
 
     /// Record completion of a request
     pub fn record_request_completion(&mut self, request: &Request) {
-        // TTFT (Time To First Token)
+        let completion_time = request.completion_time.unwrap_or(0.0);
+
+        // TTFT (Time To First Token) - use completion_time as timestamp since that's when we observe it
         if let Some(ttft_time) = request.first_token_time {
             let ttft = ttft_time - request.arrival_time;
             self.ttft_samples.push(ttft);
-            self.ttft_timestamps.push(ttft_time);
+            self.ttft_timestamps.push(completion_time);  // Use completion time, not first token time
+            self.ttft_quantiles.add(ttft);
         }
 
         // E2E latency (excluding time spent preempted)
@@ -79,14 +99,17 @@ impl MetricsCollector {
             let e2e = completion_time - request.arrival_time - request.preempted_time;
             self.e2e_latency_samples.push(e2e);
             self.e2e_timestamps.push(completion_time);
+            self.e2e_quantiles.add(e2e);
         }
 
         // Per-token latency (for decode phase)
         for i in 1..request.token_generation_times.len() {
             let prev_time = request.token_generation_times[i - 1];
             let curr_time = request.token_generation_times[i];
-            self.per_token_latency_samples.push(curr_time - prev_time);
+            let tpot = curr_time - prev_time;
+            self.per_token_latency_samples.push(tpot);
             self.per_token_timestamps.push(curr_time);
+            self.per_token_quantiles.add(tpot);
         }
 
         // Throughput counters
@@ -127,6 +150,40 @@ impl MetricsCollector {
         )
     }
 
+    /// Get latency mean for events in a time range
+    /// Returns (ttft_mean_ms, tpot_mean_ms) for samples in the given time range
+    /// Returns f64::NAN if no samples in interval (allows chart to skip intervals and draw lines)
+    pub fn get_interval_latencies(&self, start_time: f64, end_time: f64) -> (f64, f64) {
+        // Collect TTFT samples in interval
+        let ttft_interval: Vec<f64> = self.ttft_samples.iter()
+            .zip(&self.ttft_timestamps)
+            .filter(|(_, &timestamp)| timestamp > start_time && timestamp <= end_time)
+            .map(|(&sample, _)| sample * 1000.0) // Convert to ms
+            .collect();
+
+        // Collect TPOT samples in interval
+        let tpot_interval: Vec<f64> = self.per_token_latency_samples.iter()
+            .zip(&self.per_token_timestamps)
+            .filter(|(_, &timestamp)| timestamp > start_time && timestamp <= end_time)
+            .map(|(&sample, _)| sample * 1000.0) // Convert to ms
+            .collect();
+
+        // Calculate mean for each
+        let ttft_mean = if ttft_interval.is_empty() {
+            f64::NAN  // Use NaN so chart skips this point
+        } else {
+            ttft_interval.iter().sum::<f64>() / ttft_interval.len() as f64
+        };
+
+        let tpot_mean = if tpot_interval.is_empty() {
+            f64::NAN  // Use NaN so chart skips this point
+        } else {
+            tpot_interval.iter().sum::<f64>() / tpot_interval.len() as f64
+        };
+
+        (ttft_mean, tpot_mean)
+    }
+
     /// Record iteration metrics (utilization)
     pub fn record_iteration_metrics(
         &mut self,
@@ -143,12 +200,17 @@ impl MetricsCollector {
     pub fn record_throughput_sample(&mut self, current_time: f64) {
         let elapsed = current_time - self.start_time;
         if elapsed > 0.0 {
-            self.input_tokens_per_sec_samples
-                .push(self.total_input_tokens as f64 / elapsed);
-            self.output_tokens_per_sec_samples
-                .push(self.total_output_tokens as f64 / elapsed);
-            self.requests_per_sec_samples
-                .push(self.completed_requests as f64 / elapsed);
+            let input_tps = self.total_input_tokens as f64 / elapsed;
+            let output_tps = self.total_output_tokens as f64 / elapsed;
+            let req_ps = self.completed_requests as f64 / elapsed;
+
+            self.input_tokens_per_sec_samples.push(input_tps);
+            self.output_tokens_per_sec_samples.push(output_tps);
+            self.requests_per_sec_samples.push(req_ps);
+
+            self.input_tokens_per_sec_quantiles.add(input_tps);
+            self.output_tokens_per_sec_quantiles.add(output_tps);
+            self.requests_per_sec_quantiles.add(req_ps);
         }
     }
 
@@ -157,37 +219,37 @@ impl MetricsCollector {
         let elapsed = current_time - self.start_time;
 
         MetricsSummary {
-            // Latency (convert to milliseconds)
-            ttft_mean: mean(&self.ttft_samples) * 1000.0,
-            ttft_p50: percentile(&self.ttft_samples, 0.5) * 1000.0,
-            ttft_p90: percentile(&self.ttft_samples, 0.9) * 1000.0,
-            ttft_p99: percentile(&self.ttft_samples, 0.99) * 1000.0,
+            // Latency (convert to milliseconds) - use streaming quantiles for O(1) lookups
+            ttft_mean: self.ttft_quantiles.mean() * 1000.0,
+            ttft_p50: self.ttft_quantiles.p50() * 1000.0,
+            ttft_p90: self.ttft_quantiles.p90() * 1000.0,
+            ttft_p99: self.ttft_quantiles.p99() * 1000.0,
 
-            e2e_mean: mean(&self.e2e_latency_samples) * 1000.0,
-            e2e_p50: percentile(&self.e2e_latency_samples, 0.5) * 1000.0,
-            e2e_p90: percentile(&self.e2e_latency_samples, 0.9) * 1000.0,
-            e2e_p99: percentile(&self.e2e_latency_samples, 0.99) * 1000.0,
+            e2e_mean: self.e2e_quantiles.mean() * 1000.0,
+            e2e_p50: self.e2e_quantiles.p50() * 1000.0,
+            e2e_p90: self.e2e_quantiles.p90() * 1000.0,
+            e2e_p99: self.e2e_quantiles.p99() * 1000.0,
 
-            per_token_mean: mean(&self.per_token_latency_samples) * 1000.0,
-            per_token_p50: percentile(&self.per_token_latency_samples, 0.5) * 1000.0,
-            per_token_p90: percentile(&self.per_token_latency_samples, 0.9) * 1000.0,
-            per_token_p99: percentile(&self.per_token_latency_samples, 0.99) * 1000.0,
+            per_token_mean: self.per_token_quantiles.mean() * 1000.0,
+            per_token_p50: self.per_token_quantiles.p50() * 1000.0,
+            per_token_p90: self.per_token_quantiles.p90() * 1000.0,
+            per_token_p99: self.per_token_quantiles.p99() * 1000.0,
 
-            // Throughput
+            // Throughput - use streaming quantiles for O(1) lookups
             input_tokens_per_sec: self.total_input_tokens as f64 / elapsed,
-            input_tokens_per_sec_p50: percentile(&self.input_tokens_per_sec_samples, 0.5),
-            input_tokens_per_sec_p90: percentile(&self.input_tokens_per_sec_samples, 0.9),
-            input_tokens_per_sec_p99: percentile(&self.input_tokens_per_sec_samples, 0.99),
+            input_tokens_per_sec_p50: self.input_tokens_per_sec_quantiles.p50(),
+            input_tokens_per_sec_p90: self.input_tokens_per_sec_quantiles.p90(),
+            input_tokens_per_sec_p99: self.input_tokens_per_sec_quantiles.p99(),
 
             output_tokens_per_sec: self.total_output_tokens as f64 / elapsed,
-            output_tokens_per_sec_p50: percentile(&self.output_tokens_per_sec_samples, 0.5),
-            output_tokens_per_sec_p90: percentile(&self.output_tokens_per_sec_samples, 0.9),
-            output_tokens_per_sec_p99: percentile(&self.output_tokens_per_sec_samples, 0.99),
+            output_tokens_per_sec_p50: self.output_tokens_per_sec_quantiles.p50(),
+            output_tokens_per_sec_p90: self.output_tokens_per_sec_quantiles.p90(),
+            output_tokens_per_sec_p99: self.output_tokens_per_sec_quantiles.p99(),
 
             requests_per_sec: self.completed_requests as f64 / elapsed,
-            requests_per_sec_p50: percentile(&self.requests_per_sec_samples, 0.5),
-            requests_per_sec_p90: percentile(&self.requests_per_sec_samples, 0.9),
-            requests_per_sec_p99: percentile(&self.requests_per_sec_samples, 0.99),
+            requests_per_sec_p50: self.requests_per_sec_quantiles.p50(),
+            requests_per_sec_p90: self.requests_per_sec_quantiles.p90(),
+            requests_per_sec_p99: self.requests_per_sec_quantiles.p99(),
 
             // Utilization (average over all samples)
             avg_kv_cache_util: mean(&self.kv_cache_utilization_samples),

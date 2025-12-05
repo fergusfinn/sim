@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { Line, Bar } from 'react-chartjs-2'
 import {
   Chart as ChartJS,
@@ -29,8 +29,8 @@ ChartJS.register(
   Filler
 )
 
-// Import WASM module
-import init, { run_simulation } from 'sim'
+// Import WASM module (for type definitions)
+import type { run_simulation } from 'sim'
 
 interface SimulationConfig {
   hardware: {
@@ -538,30 +538,242 @@ function App() {
   const [config, setConfig] = useState<SimulationConfig>(DEFAULT_CONFIG)
   const [results, setResults] = useState<SimulationResults | null>(null)
   const [isRunning, setIsRunning] = useState(false)
-  const [wasmInitialized, setWasmInitialized] = useState(false)
+  const [workerReady, setWorkerReady] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [selectedHardware, setSelectedHardware] = useState<string>('H100')
   const [selectedModel, setSelectedModel] = useState<string>('Llama-3-70B')
   const [activeTab, setActiveTab] = useState<'metrics' | 'charts' | 'config'>('metrics')
+  const [chartsSubTab, setChartsSubTab] = useState<'timeseries' | 'distributions'>('timeseries')
   const [expandedSections, setExpandedSections] = useState({
     hardware: false,
     model: false,
     scheduler: false,
     workload: false,
   })
+  const [progressInfo, setProgressInfo] = useState<string>('')
+  const [isStreaming, setIsStreaming] = useState(false)
+  const [simulationSpeed, setSimulationSpeed] = useState<number>(2) // 0=1x, 1=10x, 2=100x, 3=MAX
 
-  // Initialize WASM on mount
+  // Create Web Worker on mount
+  const workerRef = useRef<Worker | null>(null)
+  const lastUpdateRef = useRef<number>(0)
+  const updateThrottleMs = 50 // Update UI at most every 50ms (20 times/sec)
+
+  // Histogram state: use exponential bins with lazy bin creation
+  // Store bins as a Map from binIndex to count, allows dynamic expansion
+  type LazyHistogram = {
+    base: number  // exponential base (e.g., 1.5)
+    binCounts: Map<number, number>  // binIndex -> count
+    minBinIndex: number
+    maxBinIndex: number
+  }
+
+  const [histograms, setHistograms] = useState<{
+    ttft: LazyHistogram | null
+    e2e: LazyHistogram | null
+    tpot: LazyHistogram | null
+    input_length: LazyHistogram | null
+    output_length: LazyHistogram | null
+  }>({ ttft: null, e2e: null, tpot: null, input_length: null, output_length: null })
+
+  // Helper to calculate exponential bin index for a value
+  const getExpBinIndex = (value: number, base: number): number => {
+    // Handle values close to zero (use minimum of 0.1ms)
+    if (value < 0.1) return Math.floor(Math.log(0.1) / Math.log(base))
+    return Math.floor(Math.log(value) / Math.log(base))
+  }
+
+  // Helper function to update histogram with new samples using exponential bins
+  const updateHistogramBins = (
+    currentHist: LazyHistogram | null,
+    newSamples: number[],
+    metricType: 'ttft' | 'e2e' | 'tpot' | 'input_length' | 'output_length'
+  ): LazyHistogram => {
+    if (newSamples.length === 0 && currentHist) {
+      return currentHist
+    }
+    if (newSamples.length === 0) {
+      // Empty histogram
+      return { base: 1.5, binCounts: new Map(), minBinIndex: 0, maxBinIndex: 0 }
+    }
+
+    // If no existing histogram, initialize
+    if (!currentHist) {
+      // Use exponential base of 1.5 (bins increase by 50% each time)
+      // This gives good resolution across wide dynamic range
+      const base = 1.5
+
+      const binCounts = new Map<number, number>()
+      let minBinIndex = Infinity
+      let maxBinIndex = -Infinity
+
+      for (const value of newSamples) {
+        const binIndex = getExpBinIndex(value, base)
+        binCounts.set(binIndex, (binCounts.get(binIndex) || 0) + 1)
+        minBinIndex = Math.min(minBinIndex, binIndex)
+        maxBinIndex = Math.max(maxBinIndex, binIndex)
+      }
+
+      return { base, binCounts, minBinIndex, maxBinIndex }
+    }
+
+    // Update existing histogram - lazily create bins as needed
+    const { base, binCounts, minBinIndex, maxBinIndex } = currentHist
+    const newBinCounts = new Map(binCounts)
+    let newMinBinIndex = minBinIndex
+    let newMaxBinIndex = maxBinIndex
+
+    for (const value of newSamples) {
+      const binIndex = getExpBinIndex(value, base)
+      newBinCounts.set(binIndex, (newBinCounts.get(binIndex) || 0) + 1)
+      newMinBinIndex = Math.min(newMinBinIndex, binIndex)
+      newMaxBinIndex = Math.max(newMaxBinIndex, binIndex)
+    }
+
+    return {
+      base,
+      binCounts: newBinCounts,
+      minBinIndex: newMinBinIndex,
+      maxBinIndex: newMaxBinIndex
+    }
+  }
+
+  // Helper to convert LazyHistogram to bins/counts arrays for rendering
+  const lazyHistogramToArrays = (hist: LazyHistogram | null): { bins: string[], counts: number[] } => {
+    if (!hist || hist.binCounts.size === 0) {
+      return { bins: [], counts: [] }
+    }
+
+    const { base, binCounts, minBinIndex, maxBinIndex } = hist
+    const bins: string[] = []
+    const counts: number[] = []
+
+    for (let i = minBinIndex; i <= maxBinIndex; i++) {
+      const binStart = Math.pow(base, i)
+      const binEnd = Math.pow(base, i + 1)
+      bins.push(`${Math.round(binStart)}-${Math.round(binEnd)}`)
+      counts.push(binCounts.get(i) || 0)
+    }
+
+    return { bins, counts }
+  }
+
+  // Convert lazy histograms to arrays for rendering
+  const ttftHistogram = lazyHistogramToArrays(histograms.ttft)
+  const e2eHistogram = lazyHistogramToArrays(histograms.e2e)
+  const tpotHistogram = lazyHistogramToArrays(histograms.tpot)
+  const inputLengthHistogram = lazyHistogramToArrays(histograms.input_length)
+  const outputLengthHistogram = lazyHistogramToArrays(histograms.output_length)
+
   useEffect(() => {
-    init().then(() => {
-      setWasmInitialized(true)
-    }).catch((err) => {
-      setError(`Failed to initialize WASM: ${err}`)
+    // Create worker
+    const worker = new Worker(new URL('./simulator.worker.ts', import.meta.url), {
+      type: 'module'
     })
+
+    // Handle messages from worker
+    worker.onmessage = (e) => {
+      const { type, data, error: workerError } = e.data
+
+      if (type === 'initialized') {
+        setWorkerReady(true)
+      } else if (type === 'progress') {
+        const now = Date.now()
+        setIsStreaming(true)
+
+        // Always update the text progress info
+        setProgressInfo(
+          `Time: ${data.current_time.toFixed(2)}s | ` +
+          `Completed: ${data.completed_requests}/${data.total_requests} | ` +
+          `Running: ${data.running} | Waiting: ${data.waiting}`
+        )
+
+        // Update histogram bins with new delta samples
+        if (data.latency_samples) {
+          const { ttft_samples, e2e_samples, tpot_samples } = data.latency_samples
+
+          setHistograms(prev => ({
+            ttft: updateHistogramBins(prev.ttft, ttft_samples, 'ttft'),
+            e2e: updateHistogramBins(prev.e2e, e2e_samples, 'e2e'),
+            tpot: updateHistogramBins(prev.tpot, tpot_samples, 'tpot'),
+            input_length: prev.input_length,
+            output_length: prev.output_length,
+          }))
+        }
+
+        // Update distribution histograms with new delta samples
+        if (data.distribution_samples) {
+          const { input_lengths, output_lengths } = data.distribution_samples
+
+          setHistograms(prev => ({
+            ...prev,
+            input_length: updateHistogramBins(prev.input_length, input_lengths, 'input_length'),
+            output_length: updateHistogramBins(prev.output_length, output_lengths, 'output_length'),
+          }))
+        }
+
+        // Throttle chart updates to reduce abruptness
+        if (now - lastUpdateRef.current >= updateThrottleMs) {
+          // Update partial results if time_series, metrics, OR latency_samples available
+          // This ensures results exists so charts can render
+          if (data.time_series || data.metrics || data.latency_samples) {
+            setResults({
+              metrics: data.metrics || results?.metrics || {} as any,
+              time_series: data.time_series || results?.time_series || {
+                times: [], arrivals: [], running: [], waiting: [], kv_cache_util: [],
+                num_prefilling: [], num_decoding: [], prefill_tokens: [], decode_tokens: []
+              },
+              distributions: results?.distributions || { input_lengths: [], output_lengths: [] },
+              latency_samples: results?.latency_samples || {
+                ttft_samples: [],
+                e2e_samples: [],
+                tpot_samples: [],
+                ttft_timestamps: [],
+                e2e_timestamps: [],
+                tpot_timestamps: [],
+              },
+            })
+
+            lastUpdateRef.current = now
+          }
+        }
+      } else if (type === 'complete') {
+        // Simulation complete, set final results
+        setIsStreaming(false)
+        setResults(data)
+
+        // Histograms should already be complete from streaming deltas
+        // No need to rebuild them
+
+        setIsRunning(false)
+        setProgressInfo('')
+        lastUpdateRef.current = 0
+      } else if (type === 'error') {
+        setError(`Worker error: ${workerError}`)
+        setIsRunning(false)
+        setProgressInfo('')
+        lastUpdateRef.current = 0
+      }
+    }
+
+    worker.onerror = (err) => {
+      setError(`Worker error: ${err.message}`)
+      setIsRunning(false)
+    }
+
+    workerRef.current = worker
+
+    // Initialize worker
+    worker.postMessage({ type: 'init' })
+
+    return () => {
+      worker.terminate()
+    }
   }, [])
 
   const runSimulation = async () => {
-    if (!wasmInitialized) {
-      setError("WASM not initialized yet")
+    if (!workerReady) {
+      setError("Worker not initialized yet")
       return
     }
 
@@ -569,22 +781,31 @@ function App() {
       return // Already running
     }
 
+    if (!workerRef.current) {
+      setError("Worker not available")
+      return
+    }
+
     setIsRunning(true)
     setError(null)
+    setProgressInfo('Starting simulation...')
+    setResults(null) // Clear previous results
+
+    // Clear histogram state
+    setHistograms({ ttft: null, e2e: null, tpot: null })
 
     try {
-      // config.hardware is already effective (TP scaled), backend will compute kv_cache_capacity
-      // Small delay to ensure UI updates
-      await new Promise(resolve => setTimeout(resolve, 50))
+      // Send config to worker to start simulation
       const configJson = JSON.stringify(config)
-      const result = run_simulation(configJson)
-      console.log('Simulation result:', result)
-      console.log('Distributions:', (result as any).distributions)
-      setResults(result as SimulationResults)
+      workerRef.current.postMessage({
+        type: 'run',
+        config: configJson,
+        speed: simulationSpeed,
+      })
     } catch (err) {
       setError(`Simulation error: ${err}`)
-    } finally {
       setIsRunning(false)
+      setProgressInfo('')
     }
   }
 
@@ -1141,7 +1362,7 @@ function App() {
 
           <button
             onClick={runSimulation}
-            disabled={isRunning || !wasmInitialized}
+            disabled={isRunning || !workerReady}
             className="run-button"
           >
             {isRunning ? (
@@ -1149,45 +1370,136 @@ function App() {
                 <span className="spinner"></span>
                 Running Simulation...
               </>
-            ) : wasmInitialized ? (
+            ) : workerReady ? (
               '▶ Run Simulation'
             ) : (
-              'Initializing...'
+              'Initializing Worker...'
             )}
           </button>
         </div>
 
-        {results && (
+        {(results || isRunning) && (
           <div className="results-panel">
             <div className="panel-header">
               <h2>Results</h2>
-              <div className="completion-badge">
-                {results.metrics.completed_requests}/{results.metrics.total_requests} requests completed
+              <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                  <label style={{
+                    fontSize: '0.75rem',
+                    color: 'var(--gray-600)',
+                    whiteSpace: 'nowrap',
+                    fontWeight: 500
+                  }}>
+                    Simulation Speed:
+                  </label>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem' }}>
+                    <input
+                      type="range"
+                      min="0"
+                      max="3"
+                      step="1"
+                      value={simulationSpeed}
+                      onChange={(e) => setSimulationSpeed(parseInt(e.target.value))}
+                      disabled={isRunning}
+                      list="speed-markers"
+                      style={{ width: '150px', margin: 0 }}
+                    />
+                    <datalist id="speed-markers">
+                      <option value="0"></option>
+                      <option value="1"></option>
+                      <option value="2"></option>
+                      <option value="3"></option>
+                    </datalist>
+                    <div style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      width: '150px',
+                      fontSize: '0.65rem',
+                      color: 'var(--gray-500)',
+                      fontFamily: 'monospace',
+                      paddingLeft: '2px',
+                      paddingRight: '2px'
+                    }}>
+                      <span style={{ fontWeight: simulationSpeed === 0 ? 600 : 400 }}>1x</span>
+                      <span style={{ fontWeight: simulationSpeed === 1 ? 600 : 400 }}>10x</span>
+                      <span style={{ fontWeight: simulationSpeed === 2 ? 600 : 400 }}>100x</span>
+                      <span style={{ fontWeight: simulationSpeed === 3 ? 600 : 400 }}>MAX</span>
+                    </div>
+                  </div>
+                </div>
+                {results && (
+                  <div className="completion-badge" style={{
+                    position: 'relative',
+                    overflow: 'hidden',
+                    fontSize: '0.85rem',
+                    fontFamily: 'inherit'
+                  }}>
+                    {isRunning && (
+                      <div style={{
+                        position: 'absolute',
+                        left: 0,
+                        top: 0,
+                        bottom: 0,
+                        width: `${(results.metrics.completed_requests / results.metrics.total_requests) * 100}%`,
+                        background: 'rgba(255, 255, 255, 0.25)',
+                        transition: 'width 0.2s ease',
+                        zIndex: 0
+                      }} />
+                    )}
+                    <span style={{ position: 'relative', zIndex: 1 }}>
+                      {results.metrics.completed_requests}/{results.metrics.total_requests} requests
+                      {progressInfo && (
+                        <span style={{ opacity: 0.9, fontSize: '0.8em', marginLeft: '0.5rem' }}>
+                          • {progressInfo.replace('Time: ', '').replace('Completed: ', '').replace(/\d+\/\d+ \| /, '')}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
 
             <div className="tabs">
-              <button
-                className={`tab ${activeTab === 'metrics' ? 'active' : ''}`}
-                onClick={() => setActiveTab('metrics')}
-              >
-                Metrics
-              </button>
-              <button
-                className={`tab ${activeTab === 'charts' ? 'active' : ''}`}
-                onClick={() => setActiveTab('charts')}
-              >
-                Charts
-              </button>
-              <button
-                className={`tab ${activeTab === 'config' ? 'active' : ''}`}
-                onClick={() => setActiveTab('config')}
-              >
-                Config
-              </button>
+              <div className="tabs-left">
+                <button
+                  className={`tab ${activeTab === 'metrics' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('metrics')}
+                >
+                  Metrics
+                </button>
+                <button
+                  className={`tab ${activeTab === 'charts' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('charts')}
+                >
+                  Charts
+                </button>
+                <button
+                  className={`tab ${activeTab === 'config' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('config')}
+                >
+                  Config
+                </button>
+              </div>
+
+              {activeTab === 'charts' && (
+                <div className="charts-toggle">
+                  <button
+                    className={`toggle-btn ${chartsSubTab === 'timeseries' ? 'active' : ''}`}
+                    onClick={() => setChartsSubTab('timeseries')}
+                  >
+                    Time Series
+                  </button>
+                  <button
+                    className={`toggle-btn ${chartsSubTab === 'distributions' ? 'active' : ''}`}
+                    onClick={() => setChartsSubTab('distributions')}
+                  >
+                    Distributions
+                  </button>
+                </div>
+              )}
             </div>
 
-            {activeTab === 'metrics' && (
+            {activeTab === 'metrics' && results && (
               <div className="metrics-overview">
               <div className="metrics-section">
                 <h3>Latency</h3>
@@ -1470,8 +1782,10 @@ function App() {
             </div>
             )}
 
-            {activeTab === 'charts' && (
+            {activeTab === 'charts' && results && (
             <div className="charts-section">
+              {chartsSubTab === 'timeseries' && (
+              <>
               <div className="chart-container">
                 <h3>Queue Dynamics</h3>
                 <Line
@@ -1501,6 +1815,7 @@ function App() {
                   options={{
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     interaction: {
                       mode: 'index',
                       intersect: false,
@@ -1556,6 +1871,7 @@ function App() {
                   options={{
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     interaction: {
                       mode: 'index',
                       intersect: false,
@@ -1621,6 +1937,7 @@ function App() {
                   options={{
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     interaction: {
                       mode: 'index',
                       intersect: false,
@@ -1686,6 +2003,7 @@ function App() {
                   options={{
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     interaction: {
                       mode: 'index',
                       intersect: false,
@@ -1723,14 +2041,182 @@ function App() {
               </div>
 
               <div className="chart-container">
-                <h3>Input Length Distribution</h3>
+                <h3>Throughput Over Time</h3>
+                <Line
+                  data={{
+                    labels: results.time_series.times.map(t => t.toFixed(1)),
+                    datasets: [
+                      {
+                        label: 'Input Tokens/sec',
+                        data: results.time_series.input_throughput,
+                        borderColor: '#3b82f6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        borderWidth: 2,
+                        yAxisID: 'y-input',
+                      },
+                      {
+                        label: 'Output Tokens/sec',
+                        data: results.time_series.output_throughput,
+                        borderColor: '#10b981',
+                        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        borderWidth: 2,
+                        yAxisID: 'y-output',
+                      },
+                    ],
+                  }}
+                  options={{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {
+                      mode: 'index',
+                      intersect: false,
+                    },
+                    plugins: {
+                      legend: {
+                        position: 'top',
+                        labels: {
+                          usePointStyle: true,
+                          padding: 15,
+                        },
+                      },
+                    },
+                    scales: {
+                      x: {
+                        title: {
+                          display: true,
+                          text: 'Time (seconds)',
+                        },
+                        ticks: {
+                          maxTicksLimit: 10,
+                        },
+                      },
+                      'y-input': {
+                        type: 'linear',
+                        position: 'left',
+                        title: {
+                          display: true,
+                          text: 'Input Tokens/sec',
+                        },
+                        beginAtZero: true,
+                      },
+                      'y-output': {
+                        type: 'linear',
+                        position: 'right',
+                        title: {
+                          display: true,
+                          text: 'Output Tokens/sec',
+                        },
+                        beginAtZero: true,
+                        grid: {
+                          drawOnChartArea: false,
+                        },
+                      },
+                    },
+                  }}
+                />
+              </div>
+
+              <div className="chart-container">
+                <h3>Latency Over Time</h3>
+                <Line
+                  data={{
+                    labels: results.time_series.times.map(t => t.toFixed(1)),
+                    datasets: [
+                      {
+                        label: 'TTFT p50 (ms)',
+                        data: results.time_series.ttft_p50,
+                        borderColor: '#f59e0b',
+                        backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        borderWidth: 2,
+                        yAxisID: 'y-ttft',
+                        spanGaps: true,
+                      },
+                      {
+                        label: 'TPOT p50 (ms)',
+                        data: results.time_series.tpot_p50,
+                        borderColor: '#8b5cf6',
+                        backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        borderWidth: 2,
+                        yAxisID: 'y-tpot',
+                        spanGaps: true,
+                      },
+                    ],
+                  }}
+                  options={{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {
+                      mode: 'index',
+                      intersect: false,
+                    },
+                    plugins: {
+                      legend: {
+                        position: 'top',
+                        labels: {
+                          usePointStyle: true,
+                          padding: 15,
+                        },
+                      },
+                    },
+                    scales: {
+                      x: {
+                        title: {
+                          display: true,
+                          text: 'Time (seconds)',
+                        },
+                        ticks: {
+                          maxTicksLimit: 10,
+                        },
+                      },
+                      'y-ttft': {
+                        type: 'linear',
+                        position: 'left',
+                        title: {
+                          display: true,
+                          text: 'TTFT p50 (ms)',
+                        },
+                        beginAtZero: true,
+                      },
+                      'y-tpot': {
+                        type: 'linear',
+                        position: 'right',
+                        title: {
+                          display: true,
+                          text: 'TPOT p50 (ms)',
+                        },
+                        beginAtZero: true,
+                        grid: {
+                          drawOnChartArea: false,
+                        },
+                      },
+                    },
+                  }}
+                />
+              </div>
+              </>
+              )}
+
+              {chartsSubTab === 'distributions' && (
+              <>
+              <div className="chart-container">
+                <h3>TTFT Distribution</h3>
                 <Bar
                     data={{
-                      labels: createHistogram(results.distributions?.input_lengths || [], 30).bins,
+                      labels: ttftHistogram.bins,
                       datasets: [
                         {
-                          label: 'Input Length Count',
-                          data: createHistogram(results.distributions?.input_lengths || [], 30).counts,
+                          label: 'TTFT Count',
+                          data: ttftHistogram.counts,
                           backgroundColor: 'rgba(59, 130, 246, 0.7)',
                           borderColor: '#3b82f6',
                           borderWidth: 1,
@@ -1740,6 +2226,175 @@ function App() {
                   options={{
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                      legend: {
+                        position: 'top',
+                        labels: {
+                          usePointStyle: true,
+                          padding: 15,
+                        },
+                      },
+                      tooltip: {
+                        callbacks: {
+                          title: (items) => `TTFT: ${items[0].label} ms`,
+                          label: (item) => `Count: ${item.formattedValue}`,
+                        },
+                      },
+                    },
+                    scales: {
+                      x: {
+                        title: {
+                          display: true,
+                          text: 'Time to First Token (ms)',
+                        },
+                        ticks: {
+                          maxTicksLimit: 10,
+                        },
+                      },
+                      y: {
+                        title: {
+                          display: true,
+                          text: 'Count',
+                        },
+                        beginAtZero: true,
+                      },
+                    },
+                  }}
+                />
+              </div>
+
+              <div className="chart-container">
+                <h3>E2E Latency Distribution</h3>
+                <Bar
+                    data={{
+                      labels: e2eHistogram.bins,
+                      datasets: [
+                        {
+                          label: 'E2E Latency Count',
+                          data: e2eHistogram.counts,
+                          backgroundColor: 'rgba(168, 85, 247, 0.7)',
+                          borderColor: '#a855f7',
+                          borderWidth: 1,
+                        },
+                      ],
+                  }}
+                  options={{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                      legend: {
+                        position: 'top',
+                        labels: {
+                          usePointStyle: true,
+                          padding: 15,
+                        },
+                      },
+                      tooltip: {
+                        callbacks: {
+                          title: (items) => `E2E Latency: ${items[0].label} ms`,
+                          label: (item) => `Count: ${item.formattedValue}`,
+                        },
+                      },
+                    },
+                    scales: {
+                      x: {
+                        title: {
+                          display: true,
+                          text: 'End-to-End Latency (ms)',
+                        },
+                        ticks: {
+                          maxTicksLimit: 10,
+                        },
+                      },
+                      y: {
+                        title: {
+                          display: true,
+                          text: 'Count',
+                        },
+                        beginAtZero: true,
+                      },
+                    },
+                  }}
+                />
+              </div>
+
+              <div className="chart-container">
+                <h3>Time Per Output Token Distribution</h3>
+                <Bar
+                    data={{
+                      labels: tpotHistogram.bins,
+                      datasets: [
+                        {
+                          label: 'TPOT Count',
+                          data: tpotHistogram.counts,
+                          backgroundColor: 'rgba(236, 72, 153, 0.7)',
+                          borderColor: '#ec4899',
+                          borderWidth: 1,
+                        },
+                      ],
+                  }}
+                  options={{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                      legend: {
+                        position: 'top',
+                        labels: {
+                          usePointStyle: true,
+                          padding: 15,
+                        },
+                      },
+                      tooltip: {
+                        callbacks: {
+                          title: (items) => `TPOT: ${items[0].label} ms`,
+                          label: (item) => `Count: ${item.formattedValue}`,
+                        },
+                      },
+                    },
+                    scales: {
+                      x: {
+                        title: {
+                          display: true,
+                          text: 'Time Per Output Token (ms)',
+                        },
+                        ticks: {
+                          maxTicksLimit: 10,
+                        },
+                      },
+                      y: {
+                        title: {
+                          display: true,
+                          text: 'Count',
+                        },
+                        beginAtZero: true,
+                      },
+                    },
+                  }}
+                />
+              </div>
+
+              <div className="chart-container">
+                <h3>Input Length Distribution</h3>
+                <Bar
+                    data={{
+                      labels: inputLengthHistogram.bins,
+                      datasets: [
+                        {
+                          label: 'Input Length Count',
+                          data: inputLengthHistogram.counts,
+                          backgroundColor: 'rgba(59, 130, 246, 0.7)',
+                          borderColor: '#3b82f6',
+                          borderWidth: 1,
+                        },
+                      ],
+                  }}
+                  options={{
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
                     plugins: {
                       legend: {
                         position: 'top',
@@ -1775,11 +2430,11 @@ function App() {
                 <h3>Output Length Distribution</h3>
                 <Bar
                     data={{
-                      labels: createHistogram(results.distributions?.output_lengths || [], 30).bins,
+                      labels: outputLengthHistogram.bins,
                       datasets: [
                         {
                           label: 'Output Length Count',
-                          data: createHistogram(results.distributions?.output_lengths || [], 30).counts,
+                          data: outputLengthHistogram.counts,
                           backgroundColor: 'rgba(16, 185, 129, 0.7)',
                           borderColor: '#10b981',
                           borderWidth: 1,
@@ -1789,6 +2444,7 @@ function App() {
                   options={{
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     plugins: {
                       legend: {
                         position: 'top',
@@ -1819,10 +2475,23 @@ function App() {
                   }}
                 />
               </div>
+              </>
+              )}
             </div>
             )}
 
-            {activeTab === 'config' && (
+            {!results && isRunning && (
+              <div style={{
+                padding: '3rem',
+                textAlign: 'center',
+                color: 'var(--gray-500)'
+              }}>
+                <div className="spinner" style={{ margin: '0 auto 1rem' }}></div>
+                <p>Initializing simulation...</p>
+              </div>
+            )}
+
+            {activeTab === 'config' && results && (
               <div style={{ padding: '2rem' }}>
                 <div style={{ marginBottom: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <h3 style={{ margin: 0, fontSize: '1.25rem', fontWeight: 600, color: 'var(--gray-900)' }}>

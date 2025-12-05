@@ -402,10 +402,16 @@ body {
 /* Tabs */
 .tabs {
   display: flex;
-  gap: 0.5rem;
+  justify-content: space-between;
+  align-items: center;
   padding: 0 2rem;
   border-bottom: 2px solid var(--gray-200);
   background: white;
+}
+
+.tabs-left {
+  display: flex;
+  gap: 0.5rem;
 }
 
 .tab {
@@ -437,6 +443,45 @@ body {
 .tab.active {
   color: var(--primary);
   border-bottom-color: var(--primary);
+}
+
+/* Charts Toggle (pill/segmented control) */
+.charts-toggle {
+  display: flex;
+  background: var(--gray-100);
+  border-radius: 8px;
+  padding: 4px;
+  gap: 4px;
+  margin-bottom: -2px;
+}
+
+.toggle-btn {
+  background: none;
+  border: none;
+  padding: 0.5rem 1rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--gray-600);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border-radius: 6px;
+  outline: none;
+  white-space: nowrap;
+}
+
+.toggle-btn:hover {
+  color: var(--gray-800);
+}
+
+.toggle-btn:focus {
+  outline: none;
+}
+
+.toggle-btn.active {
+  background: white;
+  color: var(--primary);
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
 /* Metrics Overview */
@@ -665,6 +710,9 @@ body {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 2rem;
+  max-height: calc(100vh - 300px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .chart-container {
